@@ -9,29 +9,32 @@ import scala.collection.mutable.ListBuffer
 import scala.collection.immutable.Map
 import scala.io.Source
 import scala.util.Random
-import scala.xml._
+import scala.xml.XML
 
 case class Morpheme( word:String, pos:String, startFlag:Boolean, endFlag:Boolean)
-
+type MorphemePair = (Morpheme,Morpheme)
+type MorphemeList = List[Morpheme]
+type Dictionary = Map[MorphemePair, MorphemeList]
 /**
   * Yahoo形態素解析APIを利用して形態素解析を行うObject
   */
 object MorphologicalAnalyser {
 
-  val appIDYahoo="dj0zaiZpPTlDZDJIaXdpTm51MiZzPWNvbnN1bWVyc2VjcmV0Jng9NTA-"
-  val secretYahoo = "acdf2937cf1f3bbd08e237a7e0e94202f8350071"
-  val url = "http://jlp.yahooapis.jp/MAService/V1/parse?appid=%s&sentence=%s"
+  val APP_ID_YAHOO="dj0zaiZpPTlDZDJIaXdpTm51MiZzPWNvbnN1bWVyc2VjcmV0Jng9NTA-"
+  val urlTemplate = "http://jlp.yahooapis.jp/MAService/V1/parse?appid=%s&sentence=%s"
 
   /**
     * 形態素解析を行い、品詞分割されたListを返します。
     */
   def apply( s:String ) = {
-    XML.loadString(
+    val words = XML.loadString(
       Source.fromURL(
-        url.format( appIDYahoo, URLEncoder.encode(s , "utf-8")),"utf-8").getLines.mkString
-    ) \\ "word" map{ word => Morpheme(word \\ "surface" text, word \\ "pos" text,false,false) }
-    // println(xml.toString())
-    // println(wordList.toString())
+        urlTemplate.format(APP_ID_YAHOO, URLEncoder.encode(s, "utf-8")), "utf-8").getLines.mkString
+    ) \\ "word"
+    words.zipWithIndex.map( word_i => {
+      val (word,i) = word_i
+      Morpheme(word \\ "surface" text, word \\ "pos" text, i==0, i==words.length)
+    })
   }
 }
 
@@ -40,77 +43,79 @@ object MorphologicalAnalyser {
   */
 
 class Markov( sentence:Seq[String] ) {
+  print("解析中")
+  val (dict, terminater) = analyze(sentence)
+  val starters = terminater.filter(_._1.startFlag)
+  def analyze(s:Seq[String]): (Dictionary, List[MorphemePair]) = {
+    val dict = s.map{ s =>
+      print(".")
+      MorphologicalAnalyser(s) match {
+        case ms if ms.length < 2 => Map[MorphemePair,MorphemeList]()
+        case ms =>
+          ( (Map((ms(0),ms(1))->(ms(2)::Nil)),ms(1),ms(2)) /: ms.drop(2)) (
+            (dict_1_2, xn) => {
+              val (dict,x1,x2)=dict_1_2
+              (dict + ((x1, x2)->(xn +: dict.getOrElse((x1,x2),List[Morpheme]()))), x2, xn)
+            } )._1
+      }
+    }.reduce((a,b) => a ++ b)
+
+    // printDict(dict)
+
+    val terminater = dict.keys.toList
+    // println(s"terminator: ${terminater}")
+    // println("done.")
+    (dict, terminater)
+  }
+
+  def printDict(dict:Dictionary):Unit = {
+    println("dict")
+    dict.foreach(kv => {
+      val (mPair, mList) = kv
+      val (m1, m2) = mPair
+      print(s"${m1.word}-${m2.word}:")
+      println(mList.map(_.word).mkString(","))
+    })
+  }
 
   val rnd = new Random
   val maxKeyCnt = 3
-  var dict:Map[(Morpheme, Morpheme), List[Morpheme]] = Map.empty
-  var terminater:ListBuffer[(Morpheme, Morpheme)] = new ListBuffer
-
-  print("解析中")
-  sentence.foreach{ s =>
-    print(".")
-    MorphologicalAnalyser( s ) match {
-      case ms if ms.length < 2 =>
-      case ms =>
-        // println(ms)
-        // println(ms(0)+" "+ms(1))
-        // println(ms.drop(2))
-        terminater += ((ms(0),ms(1)) /: ms.drop(2)) {
-          case (key, m) => dict.get(key) match {
-            case None => dict += key -> (m :: Nil)
-            case Some(xs) => dict += key -> (m :: xs)
-          }
-           // if( m.pos == "特殊" ) terminater += (key._2, m)
-          (key._2,m)
-        }
-    }
-  }
-  println("dict")
-  dict.foreach(x => {
-      print(x._1._1.word+"-"+x._1._2.word+":")
-      println(x._2.foreach(y => print(y.word+",")))
-    })
-  println("terminator"+terminater)
-  println("done.")
 
   def generate( n:Int ):String = {
-    if (n == 0) ""
-    else {
-      val (m1, m2) = terminater(rnd.nextInt(terminater.length))
-      var selected = Map[(Morpheme, Morpheme), Int]((m1, m2) -> 1)
+    if (n == 0) return ""
+    val (m1, m2) = starters(rnd.nextInt(starters.length))
+    val selected = Map[MorphemePair, Int]((m1, m2) -> 1)
+    val (phrase, _) = gen((m1,m2), selected)
+    // selected = newSelected
+    m1.word + m2.word + phrase +"\n" + generate(n - 1)
+  }
 
-      def gen(key: (Morpheme, Morpheme)): String = {
-        val selectedCnt = selected.get(key).getOrElse(0) + 1
-        if (selectedCnt >= maxKeyCnt) ""
-        else {
-          selected += key -> selectedCnt
-          dict.get(key) match {
-            case None => ""
-            case Some(Nil) => ""
-            case Some(xs) => {
-              val m = xs(rnd.nextInt(xs.length))
-              m.word + gen((key._2, m))
-            }
-          }
-        }
+  def gen(key: MorphemePair, selected:Map[MorphemePair, Int]): (String, Map[MorphemePair, Int]) = {
+    val selectedCnt = selected.get(key).getOrElse(0) + 1
+    if (selectedCnt >= maxKeyCnt) return ("", selected)
+    val newSelected = selected + (key -> selectedCnt)
+    dict.get(key) match {
+      case Some(xs) => {
+        val m = xs(rnd.nextInt(xs.length))
+        val (phrase, newSelected2) = gen((key._2, m), newSelected)
+        (m.word + phrase, newSelected2)
       }
-      m1.word + m2.word + gen((m1, m2)) + generate(n - 1)
+      case _=> ("", newSelected)
     }
   }
+
 }
 
 
 object Main{
   def main( args:Array[String] ) = {
-    println("Feed(RSS1.0/RSS2.0)のURLを入力してください。")
-    print(" > ")
+    // println("Feed(RSS1.0/RSS2.0)のURLを入力してください。")
+    // print(" > ")
     val url = "http://gyao.yahoo.co.jp/rss/newlypg/all/"
     val source = Source.fromURL(url,"utf-8")
     val xml = XML.loadString(source.getLines.mkString)
-    val nodeList = (xml \\ "item" \\ "description").toList
-    var textList:List[String] = List()
-    nodeList.foreach(node => textList = node.text::textList)
-    println(textList)
+    val textList = (xml \\ "item" \\ "description").map(n => n.text)
+    textList.foreach(println)
     val markov = new Markov(textList)
     println ("生成文書:"+markov.generate(10))
     // val s = MorphologicalAnalyser(textList.head)
